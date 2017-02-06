@@ -26,7 +26,6 @@
 #include <linux/uaccess.h>
 #include <linux/msm_mdp.h>
 
-#include "mdss_livedisplay.h"
 #include <linux/display_state.h>
 #include "mdss_dsi.h"
 #include "mdss_dba_utils.h"
@@ -1132,12 +1131,9 @@ static int mdss_dsi_post_panel_on(struct mdss_panel_data *pdata)
 		return -EINVAL;
 	}
 
-<<<<<<< HEAD
-=======
 	display_on = true;
 
 	pinfo = &pdata->panel_info;
->>>>>>> 3430bd4... display: add a simple api to query the display state (on/off) at any point in time
 	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
 
