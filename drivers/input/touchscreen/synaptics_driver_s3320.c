@@ -3891,6 +3891,36 @@ err_pinctrl_get:
 	return retval;
 }
 
+static void synaptics_suspend_resume(struct work_struct *work)
+{
+	struct synaptics_ts_data *ts = container_of(work, typeof(*ts), pm_work);
+
+	if (ts->screen_off) {
+		if (ts->gesture_enable) {
+			synaptics_enable_interrupt_for_gesture(ts, true);
+		} else {
+			touch_disable(ts);
+			if (ts->support_hw_poweroff) {
+				tpd_power(ts, 0);
+				pinctrl_select_state(ts->pinctrl,
+					ts->pinctrl_state_suspend);
+			}
+		}
+		ts->touch_active = false;
+	} else {
+		if (ts->gesture_enable) {
+			synaptics_enable_interrupt_for_gesture(ts, false);
+		} else {
+			if (ts->support_hw_poweroff) {
+				pinctrl_select_state(ts->pinctrl,
+					ts->pinctrl_state_active);
+				tpd_power(ts, 1);
+			}
+			touch_enable(ts);
+		}
+	}
+}
+
 #ifdef SUPPORT_VIRTUAL_KEY
 #define VK_KEY_X    180
 #define VK_CENTER_Y 2020//2260
