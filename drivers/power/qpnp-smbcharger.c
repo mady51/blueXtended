@@ -195,6 +195,8 @@ struct smbchg_chip {
 	bool				hvdcp_not_supported;
 	bool				otg_pinctrl;
 	bool				cfg_override_usb_current;
+	bool				boot_usb_present;
+	bool				re_trigr_dash_done;
 	u8				original_usbin_allowance;
 	struct parallel_usb_cfg		parallel;
 	struct delayed_work		parallel_en_work;
@@ -386,6 +388,7 @@ struct smbchg_chip {
 	struct delayed_work 		re_det_work;
 	struct delayed_work 		check_switch_dash_work;
 	struct delayed_work 		non_standard_charger_check_work;
+	struct delayed_work 		rechk_sw_dsh_work;
 	struct votable			*hw_aicl_rerun_disable_votable;
 	struct votable			*hw_aicl_rerun_enable_indirect_votable;
 	struct votable			*aicl_deglitch_short_votable;
@@ -3181,7 +3184,12 @@ static int set_usb_current_limit_vote_cb(struct device *dev,
 {
 	struct smbchg_chip *chip = dev_get_drvdata(dev);
 	int rc, aicl_ma, effective_id;
+	const char *effective_client;
 
+	if (icl_ma < 0) {
+		pr_err("No voters\n");
+		return 0;
+	}
 	effective_id = get_effective_client_id_locked(chip->usb_icl_votable);
 
 	/* disable parallel charging if HVDCP is voting for 300mA */
@@ -4213,7 +4221,47 @@ static bool qpnp_set_fast_chg_allow(struct smbchg_chip *chip, bool enable)
 	}
 }
 
+#define TIME_200MS 200
+#define TIME_3S 3000
+#define DASH_CHECK_COUNT 4
+
 static bool usb_switched = false;
+static void set_usb_switch(struct smbchg_chip *chg, bool enable)
+{
+	int retrger_time;
+	if (!fast_charger) {
+		pr_err("no fast_charger register found\n");
+		return;
+	}
+
+	if (enable) {
+		pr_err("switch on fastchg\n");
+		if (chg->boot_usb_present && chg->re_trigr_dash_done) {
+			vote(chg->usb_icl_votable, PSY_ICL_VOTER,
+					true, 0);
+			usleep_range(500000, 510000);
+			vote(chg->usb_icl_votable, PSY_ICL_VOTER,
+					true, CURRENT_1500_MA);
+		}
+		set_mcu_en_gpio_value(1);
+		msleep(10);
+		usb_sw_gpio_set(1);
+		msleep(10);
+		mcu_en_gpio_set(0);
+		if (chg->boot_usb_present)
+			retrger_time = TIME_3S;
+		else
+			retrger_time = TIME_200MS;
+		if (!chg->re_trigr_dash_done)
+			schedule_delayed_work(&chg->rechk_sw_dsh_work,
+					msecs_to_jiffies(retrger_time));
+	} else {
+		pr_err("switch off fastchg\n");
+		usb_sw_gpio_set(0);
+		mcu_en_gpio_set(1);
+	}
+}
+
 static void switch_fast_chg(struct smbchg_chip *chip)
 {
 	bool fastchg_allowed, is_allowed;
@@ -5283,6 +5331,8 @@ static void handle_usb_removal(struct smbchg_chip *chip)
 		chip->recharge_status = false;
 		chip->usb_enum_status = false;
 		chip->non_std_chg_present = false;
+		chip->boot_usb_present = true;
+		chip->re_trigr_dash_done = 0;
 		qpnp_battery_temp_region_set(chip, BATT_TEMP_INVALID);
 		wake_unlock(&chip->chg_wake_lock);
 	}
