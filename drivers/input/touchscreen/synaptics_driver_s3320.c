@@ -351,19 +351,6 @@ static void synaptics_hard_reset(struct synaptics_ts_data *ts);
 static int set_changer_bit(struct synaptics_ts_data *ts);
 static int tp_baseline_get(struct synaptics_ts_data *ts,bool flag);
 
-/*-------------------------------Using Struct----------------------------------*/
-struct point_info {
-	unsigned char status;
-	int x;
-	int raw_x;
-	int y;
-	int raw_y;
-	int z;
-#ifdef REPORT_2D_PRESSURE
-    unsigned char pressure;
-#endif
-};
-
 static const struct i2c_device_id synaptics_ts_id[] = {
 	{ TPD_DEVICE, 0 },
 	{ }
@@ -427,7 +414,6 @@ static struct i2c_driver tpd_i2c_driver = {
 struct synaptics_ts_data {
 	struct i2c_client *client;
 	struct mutex mutex;
-	struct mutex mutexreport;
 	int irq;
 	int irq_gpio;
 	atomic_t irq_enable;
@@ -487,6 +473,15 @@ struct synaptics_ts_data {
 #ifdef SUPPORT_VIRTUAL_KEY
         struct kobject *properties_kobj;
 #endif
+
+	struct work_struct pm_work;
+
+	struct wakeup_source syna_isr_ws;
+	spinlock_t isr_lock;
+	bool i2c_awake;
+	struct completion i2c_resume;
+
+	bool touch_active;
 };
 
 static struct device_attribute attrs_oem[] = {
@@ -1273,155 +1268,55 @@ Left2RightSwip:%d Right2LeftSwip:%d Up2DownSwip:%d Down2UpSwip:%d\n",
 #ifdef REPORT_2D_PRESSURE
 static unsigned char pres_value = 1;
 #endif
-#ifdef SUPPORT_VIRTUAL_KEY //WayneChang, 2015/12/02, add for key to abs, simulate key in abs through virtual key system
-extern struct completion key_cm;
-#endif
-void int_touch(void)
+static bool int_touch(struct synaptics_ts_data *ts, ktime_t timestamp)
 {
-	int ret = -1,i = 0;
-	uint8_t buf[90];
-	uint8_t count_data = 0;
-	uint8_t object_attention[2];
-	uint16_t total_status = 0;
-	uint8_t finger_num = 0;
-	uint8_t finger_status = 0;
-	struct point_info points;
-	uint32_t finger_info = 0;
-	static uint8_t current_status = 0;
-	uint8_t last_status = 0 ;
-	struct synaptics_ts_data *ts = ts_g;
+	uint8_t buf[80];
+	int i, ret;
+	bool finger_present = false;
 
-	memset(buf, 0, sizeof(buf));
-	points.x = 0;
-	points.y = 0;
-	points.z = 0;
-	points.status = 0;
-
-	mutex_lock(&ts->mutexreport);
-#ifdef REPORT_2D_PRESSURE
-    if (ts->support_ft){
-        ret = i2c_smbus_write_byte_data(ts->client, 0xff, 0x4);
-        ret = synaptics_rmi4_i2c_read_block(ts->client, 0x19,\
-            sizeof(points.pressure), &points.pressure);
-        if (ret < 0) {
-            TPD_ERR("synaptics_int_touch: i2c_transfer failed\n");
-            goto INT_TOUCH_END;
-        }
-        if (0 == points.pressure)//workaround for have no pressure value input reader into hover mode
-        {
-            pres_value++;
-            if (255 == pres_value)
-                pres_value = 1;
-        }
-        else
-        {
-            pres_value = points.pressure;
-        }
-    }
-#endif
-	ret = i2c_smbus_write_byte_data(ts->client, 0xff, 0x0);
-	if(version_is_s3508)
-		F12_2D_DATA15 = 0x0009;
-	else
-		F12_2D_DATA15 = 0x000C;
-	ret = synaptics_rmi4_i2c_read_block(ts->client, F12_2D_DATA15, 2, object_attention);
-    if (ret < 0) {
-        TPD_ERR("synaptics_int_touch F12_2D_DATA15: i2c_transfer failed\n");
-        goto INT_TOUCH_END;
-    }
-	total_status = (object_attention[1] << 8) | object_attention[0];
-
-	if(total_status){
-		while(total_status){
-			count_data++;
-			total_status >>= 1;
-		}
-	}else{
-		count_data = 0;
-	}
-    if(count_data > 10){
-        TPD_ERR("synaptics_int_touch count_data is %d\n", count_data);
-        goto INT_TOUCH_END;
-    }
-	ret = synaptics_rmi4_i2c_read_block(ts->client, F12_2D_DATA_BASE, count_data*8+1, buf);
-	if (ret < 0) {
-		TPD_ERR("synaptics_int_touch F12_2D_DATA_BASE: i2c_transfer failed\n");
-		goto INT_TOUCH_END;
-	}
-	for( i = 0; i < count_data; i++ ) {
-		points.status = buf[i*8];
-		points.x = ((buf[i*8+2]&0x0f)<<8) | (buf[i*8+1] & 0xff);
-		points.raw_x = buf[i*8+6] & 0x0f;
-		points.y = ((buf[i*8+4]&0x0f)<<8) | (buf[i*8+3] & 0xff);
-		points.raw_y = buf[i*8+7] & 0x0f;
-		points.z = buf[i*8+5];
-		finger_info <<= 1;
-		finger_status =  points.status & 0x03;
-		if (finger_status) {
-			input_mt_slot(ts->input_dev, i);
-			input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, finger_status);
-			input_report_key(ts->input_dev, BTN_TOOL_FINGER, 1);
-			input_report_abs(ts->input_dev, ABS_MT_POSITION_X, points.x);
-			input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, points.y);
-			//#ifdef REPORT_2D_W
-			input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, max(points.raw_x, points.raw_y));
-			input_report_abs(ts->input_dev, ABS_MT_TOUCH_MINOR, min(points.raw_x, points.raw_y));
-			//#endif
-#ifdef REPORT_2D_PRESSURE
-            if (ts->support_ft){
-                input_report_abs(ts->input_dev,ABS_MT_PRESSURE,pres_value);
-                TPD_DEBUG("%s: pressure%d[%d]\n",__func__,i,pres_value);
-            }
-#endif
-#ifndef TYPE_B_PROTOCOL
-			input_mt_sync(ts->input_dev);
-#endif
-			complete(&key_cm);
-			finger_num++;
-			finger_info |= 1 ;
-			//TPD_DEBUG("%s: Finger %d: status = 0x%02x "
-					//"x = %4d, y = %4d, wx = %2d, wy = %2d\n",
-					//__func__, i, points.status, points.x, points.y, points.raw_x, points.raw_y);
-
-		}
-	}
-	finger_info <<= (ts->max_num - count_data);
-
-	for ( i = 0; i < ts->max_num; i++ )
-	{
-		finger_status = (finger_info>>(ts->max_num-i-1)) & 1 ;
-		if(!finger_status)
-		{
-			input_mt_slot(ts->input_dev, i);
-			input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, finger_status);
-		}
-
+	i2c_smbus_write_byte_data(ts->client, 0xff, 0x00);
+	ret = synaptics_rmi4_i2c_read_block(ts->client, F12_2D_DATA_BASE, 80, buf);
+	if (unlikely(ret < 0)) {
+		TPD_ERR("int_touch: i2c_transfer failed\n");
+		return false;
 	}
 
-	last_status = current_status & 0x02;
+	input_event(ts->input_dev, EV_SYN, SYN_TIME_SEC,
+			ktime_to_timespec(timestamp).tv_sec);
+	input_event(ts->input_dev, EV_SYN, SYN_TIME_NSEC,
+			ktime_to_timespec(timestamp).tv_nsec);
 
-	if (finger_num == 0/* && last_status && (check_key <= 1)*/)
-	{
-		input_report_key(ts->input_dev, BTN_TOOL_FINGER, 0);
-#ifndef TYPE_B_PROTOCOL
-		input_mt_sync(ts->input_dev);
-#endif
+	for (i = 0; i < 10; i++) {
+		int x, y, raw_x, raw_y;
+		uint8_t status;
+
+		status = buf[i * 8] & 0x03;
+
+		input_mt_slot(ts->input_dev, i);
+		input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, status);
+
+		if (!status)
+			continue;
+
+		x = ((buf[i * 8 + 2] & 0x0f) << 8) | buf[i * 8 + 1];
+		y = ((buf[i * 8 + 4] & 0x0f) << 8) | buf[i * 8 + 3];
+		raw_x = buf[i * 8 + 6] & 0x0f;
+		raw_y = buf[i * 8 + 7] & 0x0f;
+
+		input_report_abs(ts->input_dev, ABS_MT_POSITION_X, x);
+		input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, y);
+		input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, max(raw_x, raw_y));
+		input_report_abs(ts->input_dev, ABS_MT_TOUCH_MINOR, min(raw_x, raw_y));
+
+		finger_present = true;
 	}
+
 	input_sync(ts->input_dev);
 
-	if ((finger_num == 0) && (get_tp_base == 0)){//all finger up do get base once
-		get_tp_base = 1;
-		TPD_ERR("start get base data:%d\n",get_tp_base);
-		tp_baseline_get(ts, false);
-	}
-
-#ifdef SUPPORT_GESTURE
-	if (ts->in_gesture_mode == 1 && ts->is_suspended == 1) {
+	if (ts->in_gesture_mode && ts->screen_off)
 		gesture_judge(ts);
-	}
-#endif
-    INT_TOUCH_END:
-	mutex_unlock(&ts->mutexreport);
+
+	return finger_present;
 }
 
 static void synaptics_ts_work_func(struct work_struct *work)
@@ -1492,9 +1387,61 @@ static enum hrtimer_restart synaptics_ts_timer_func(struct hrtimer *timer)
 #else
 static irqreturn_t synaptics_irq_thread_fn(int irq, void *dev_id)
 {
-	struct synaptics_ts_data *ts = (struct synaptics_ts_data *)dev_id;
-    touch_disable(ts);
-	synaptics_ts_work_func(&ts->report_work);
+	struct synaptics_ts_data *ts = dev_id;
+	ktime_t now;
+	int ret;
+
+	if (ts->screen_off) {
+		unsigned long flags;
+		bool i2c_active;
+
+		spin_lock_irqsave(&ts->isr_lock, flags);
+		i2c_active = ts->i2c_awake;
+		spin_unlock_irqrestore(&ts->isr_lock, flags);
+
+		/* I2C bus must be active */
+		if (!i2c_active) {
+			__pm_stay_awake(&ts->syna_isr_ws);
+			/* Wait for I2C to resume before proceeding */
+			reinit_completion(&ts->i2c_resume);
+			wait_for_completion_timeout(&ts->i2c_resume,
+							msecs_to_jiffies(30));
+		}
+	}
+
+	now = ktime_get();
+
+	synaptics_rmi4_i2c_write_byte(ts->client, 0xff, 0x00);
+	ret = synaptics_rmi4_i2c_read_word(ts->client, F01_RMI_DATA_BASE);
+	if (ret < 0) {
+		TPDTM_DMESG("Synaptic:ret = %d\n", ret);
+		synaptics_hard_reset(ts);
+		goto exit;
+	}
+
+	if (ret & 0x80) {
+		synaptics_init_panel(ts);
+
+		if (ts->screen_off && ts->gesture_enable)
+			synaptics_enable_interrupt_for_gesture(ts, true);
+	}
+
+	if (ret & 0x400) {
+		bool finger_present = int_touch(ts, now);
+
+		ts->touch_active = finger_present;
+
+		/* All fingers up; do get base once */
+		if (!get_tp_base && !finger_present) {
+			get_tp_base = 1;
+			TPD_ERR("start get base data: 1\n");
+			schedule_work(&ts->base_work_intr);
+		}
+	}
+
+exit:
+	if (ts->syna_isr_ws.active)
+		__pm_relax(&ts->syna_isr_ws);
 	return IRQ_HANDLED;
 }
 #endif
@@ -2439,7 +2386,6 @@ static int	synaptics_input_init(struct synaptics_ts_data *ts)
 	set_bit(ABS_MT_POSITION_X, ts->input_dev->absbit);
 	set_bit(ABS_MT_POSITION_Y, ts->input_dev->absbit);
 	set_bit(INPUT_PROP_DIRECT, ts->input_dev->propbit);
-	set_bit(BTN_TOOL_FINGER, ts->input_dev->keybit);
 #ifdef SUPPORT_GESTURE
 	set_bit(KEY_F4 , ts->input_dev->keybit);//doulbe-tap resume
 	set_bit(KEY_DOUBLE_TAP, ts->input_dev->keybit);
@@ -2781,7 +2727,6 @@ static ssize_t tp_reset_write_func (struct file *file, const char *buffer, size_
 #ifndef TYPE_B_PROTOCOL
         input_mt_sync(ts->input_dev);
 #endif
-        input_report_key(ts->input_dev, BTN_TOOL_FINGER, 0);
 	input_sync(ts->input_dev);
     }
 	return count;
@@ -4010,8 +3955,6 @@ static int synaptics_ts_probe(struct i2c_client *client, const struct i2c_device
         }
     msleep(100);//after power on tp need sometime from bootloader to ui mode
 	mutex_init(&ts->mutex);
-	mutex_init(&ts->mutexreport);
-    atomic_set(&ts->irq_enable,0);
 
 	ts->is_suspended = 0;
 	atomic_set(&ts->is_stop,0);
