@@ -38,31 +38,6 @@
 #include <linux/input.h>
 #include <linux/interrupt.h>
 #include <linux/of_gpio.h>
-#include <linux/regulator/consumer.h>
-#include <soc/qcom/scm.h>
-
-#include <linux/wakelock.h>
-#include <linux/input.h>
-
-#ifdef CONFIG_FB
-#include <linux/fb.h>
-#include <linux/notifier.h>
-#endif
-
-#include <linux/project_info.h>
-
-static unsigned int ignor_home_for_ESD = 0;
-module_param(ignor_home_for_ESD, uint, S_IRUGO | S_IWUSR);
-
-#define FPC1020_RESET_LOW_US 1000
-#define FPC1020_RESET_HIGH1_US 100
-#define FPC1020_RESET_HIGH2_US 1250
-#define FPC_TTW_HOLD_TIME 1000
-
-/* Unused key value to avoid interfering with active keys */
-#define KEY_FINGERPRINT 0x2ee
-
-#define ONEPLUS_EDIT  //Onplus modify for msm8996 platform and 15801 HW
 #include <linux/platform_device.h>
 #include <linux/pm_wakeup.h>
 
@@ -90,7 +65,6 @@ struct fpc1020_data {
 };
 
 extern bool s3320_touch_active(void);
-extern bool virtual_key_enable;
 
 static void hw_reset(struct fpc1020_data *f)
 {
@@ -212,15 +186,6 @@ static ssize_t irq_get(struct device *dev,
 static ssize_t screen_state_get(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
-	struct fpc1020_data* fpc1020 = dev_get_drvdata(device);
-	dev_dbg(fpc1020->dev, "%s\n", __func__);
-	return count;
-}
-static DEVICE_ATTR(irq, S_IRUSR | S_IWUSR, irq_get, irq_ack);
-extern void int_touch(void);
-extern struct completion key_cm;
-extern bool virtual_key_enable;
-extern bool s1302_is_keypad_stopped(void);
 	struct fpc1020_data *f = dev_get_drvdata(dev);
 
 	return scnprintf(buf, PAGE_SIZE, "%d\n", !f->screen_off);
@@ -246,6 +211,7 @@ static ssize_t proximity_state_set(struct device *dev,
 	ret = kstrtoint(buf, 10, &val);
 	if (ret)
 		return -EINVAL;
+
 	f->proximity_state = !!val;
 
 	if (f->screen_off)
@@ -260,7 +226,7 @@ static ssize_t report_home_set(struct device *dev,
 	struct fpc1020_data *f = dev_get_drvdata(dev);
 
 	if (!memcmp(buf, "down", sizeof("down"))) {
-		if (!s3320_touch_active() && !virtual_key_enable) {
+		if (!s3320_touch_active()) {
 			input_report_key(f->input_dev, KEY_HOME, 1);
 			input_sync(f->input_dev);
 		}
@@ -285,7 +251,6 @@ static struct attribute *attributes[] = {
 	&dev_attr_irq.attr,
 	&dev_attr_proximity_state.attr,
 	&dev_attr_report_home.attr,
-	&dev_attr_update_info.attr,
 	&dev_attr_screen_state.attr,
 	NULL
 };
@@ -357,12 +322,6 @@ static irqreturn_t fpc1020_irq_handler(int irq, void *dev_id)
 
 	if (f->screen_off)
 		__pm_wakeup_event(&f->ttw_ws, FPC_TTW_HOLD_TIME_MS);
-
-	/* Report button input to trigger CPU boost */
-	input_report_key(fpc1020->input_dev, KEY_FINGERPRINT, 1);
-	input_sync(fpc1020->input_dev);
-	input_report_key(fpc1020->input_dev, KEY_FINGERPRINT, 0);
-	input_sync(fpc1020->input_dev);
 
 	return IRQ_HANDLED;
 }
